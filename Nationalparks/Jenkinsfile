@@ -1,0 +1,194 @@
+#!groovy
+// Jenkinsfile for Nationalparks
+podTemplate(
+  label: "skopeo-pod",
+  cloud: "openshift",
+  inheritFrom: "maven",
+  containers: [
+    containerTemplate(
+      name: "jnlp",
+      image: "docker-registry.default.svc:5000/${GUID}-jenkins/jenkins-slave-maven-skopeo-centos7:v3.9",
+      resourceRequestMemory: "1Gi",
+      resourceLimitMemory: "2Gi"
+    )
+  ]
+) {
+  node('skopeo-pod') {
+    echo "GUID: ${GUID}"
+    echo "CLUSTER: ${CLUSTER}"
+
+    // Define Maven Command to point to correct nexus_settings.xml.
+    def mvnCmd = "mvn -s ../nexus_settings.xml"
+    // Define Maven Sonarqube Command.
+    def mvnSonar = "mvn sonar:sonar -s ../nexus_settings.xml"
+
+    // Checkout Source Code
+    stage('Checkout Source') {
+      git 'https://github.com/c4lv1n8/adv_homework.git'
+    }
+
+    // Extract version and other properties from the pom.xml
+    def groupId    = getGroupIdFromPom("Nationalparks/pom.xml")
+    def artifactId = getArtifactIdFromPom("Nationalparks/pom.xml")
+    def version    = getVersionFromPom("Nationalparks/pom.xml")
+
+    // Set the tag for the development image: version + build number
+    def devTag  = "${version}-${BUILD_NUMBER}"
+    // Set the tag for the production image: version
+    def prodTag = "${version}"
+
+    // Using Maven build the jar file
+    stage('Build jar') {
+      echo "Building version ${version}"
+      sh "sed -i \"s/GUID/${GUID}/g\" nexus_settings.xml"
+      dir('Nationalparks') {
+        sh "${mvnCmd} clean install -Dmaven.test.skip=true"
+      }
+    }
+
+    // Using Maven run the unit tests
+    stage('Unit Tests') {
+      echo "Running Unit Tests"
+      dir('Nationalparks') {
+        sh "${mvnCmd} test"
+      }
+    }
+  
+    // Using Maven call SonarQube for Code Analysis
+    stage('Code Analysis') {
+      echo "Running Code Analysis"
+      dir('Nationalparks') {
+        sh "${mvnSonar} -Dsonar.host.url=http://sonarqube-${GUID}-sonarqube.apps.${CLUSTER}"
+      }
+    }
+
+    // Publish the built jar file to Nexus
+    stage('Publish to Nexus') {
+      echo "Publish to Nexus"
+      dir('Nationalparks') {
+        sh "${mvnCmd} deploy -DskipTests=true -DaltDeploymentRepository=nexus::default::http://nexus3-${GUID}-nexus.apps.${CLUSTER}/repository/releases"
+      }
+    }
+
+    // Build the OpenShift Image in OpenShift and tag it.
+    stage('Build and Tag OpenShift Image') {
+      echo "Building OpenShift container image nationalparks:${devTag}"
+      // Start build with compiled file from Nexus
+      sh "oc start-build nationalparks --from-file=http://nexus3-${GUID}-nexus.apps.${CLUSTER}/repository/releases/com/openshift/evg/roadshow/nationalparks/${version}/nationalparks-${version}.jar --follow -n ${GUID}-parks-dev"
+      // Tag Image with new tag generated via pipeline syntax generator in Jenkins
+      openshiftTag alias: 'false', destStream: 'nationalparks', destTag: "${devTag}", destinationNamespace: "${GUID}-parks-dev", namespace: "${GUID}-parks-dev", srcStream: 'nationalparks', srcTag: 'latest', verbose: 'false'
+    }
+
+    // Blue/Green Deployment into Dev
+    // -------------------------------------
+    // Do not activate the new version yet.
+    def destDevColour = "Blue"
+    def activeDevColour = "Green"
+
+    stage('Blue/Green Dev Deployment') {
+      // Logic to identify next deployment colour (blue or green)
+      activeDevColour = sh(returnStdout: true, script: "oc get service nationalparks -n ${GUID}-parks-dev -o 'jsonpath={ .metadata.labels.activeDevColour }' --ignore-not-found=true").trim()
+      if (activeDevColour == "Blue") {
+        destDevColour = "Green"
+      }
+      echo "Deploying container image to Development Project"
+      // Set Deployment image to correct version
+      sh "oc set image dc/nationalparks nationalparks=docker-registry.default.svc:5000/${GUID}-parks-dev/nationalparks:${devTag} -n ${GUID}-parks-dev"
+      // Update configMap used to set build (blue/green) deployment
+      sh "oc delete configmap nationalparks-config -n ${GUID}-parks-dev --ignore-not-found"
+      sh "oc create configmap nationalparks-config -n ${GUID}-parks-dev --from-literal=APPNAME='National Parks (Dev)' --from-literal=DEPLOYNAME='${destDevColour}'"
+      // Deploy image
+      openshiftDeploy depCfg: 'nationalparks', namespace: "${GUID}-parks-dev", verbose: 'false', waitTime: '', waitUnit: 'sec'
+      // Verify Deployment
+      openshiftVerifyDeployment depCfg: 'nationalparks', namespace: "${GUID}-parks-dev", verbose: 'false', replicaCount: '1', verifyReplicaCount: 'false', waitTime: '30', waitUnit: 'sec'
+      // Recreate MLB back-end service
+      sh "oc delete service nationalparks -n ${GUID}-parks-dev --ignore-not-found=true"
+      sh "oc expose dc nationalparks --port 8080 --labels=type=parksmap-backend,activeDevColour=${destDevColour} -n ${GUID}-parks-dev"
+      // Verify Service
+      openshiftVerifyService apiURL: '', authToken: '', namespace: "${GUID}-parks-dev", svcName: 'nationalparks', verbose: 'false'
+    }
+
+    // Run Integration Tests in the Development Environment.
+    stage('Dev Integration Tests') {
+      echo "Running Integration Tests"
+      // Waiting for Application
+      sleep 35
+      // Curl status of application with /wz/health/ URL
+      sh "curl http://nationalparks.${GUID}-parks-dev.svc.cluster.local:8080/ws/healthz/ | grep -q 'OK'"
+      // Curl endpoint to load data from application into backend database
+      sh "curl http://nationalparks.${GUID}-parks-dev.svc.cluster.local:8080/ws/data/load/ | grep -q 'Items inserted in database: 2740'"
+    }
+
+    // Copy Image to Nexus Docker Registry
+    stage('Copy Image to Nexus Docker Registry') {
+      echo "Copy image to Nexus Docker Registry"
+      sh "skopeo copy --src-tls-verify=false --dest-tls-verify=false --src-creds openshift:\$(oc whoami -t) --dest-creds=admin:admin123 docker://docker-registry.default.svc:5000/${GUID}-parks-dev/nationalparks:${devTag} docker://nexus-registry-${GUID}-nexus.apps.${CLUSTER}/${GUID}-parks-dev/nationalparks:${devTag}"
+      openshiftTag alias: 'false', destStream: 'nationalparks', destTag: "${prodTag}", destinationNamespace: "${GUID}-parks-dev", namespace: "${GUID}-parks-dev", srcStream: 'nationalparks', srcTag: "${devTag}", verbose: 'false'
+    }
+
+    // Blue/Green Deployment into Production
+    // -------------------------------------
+    // Do not activate the new version yet.
+    def destApp   = "nationalparks-blue"
+    def destColour = "Blue"
+    def activeApp = "nationalparks-green"
+    def activeColour = "Green"
+
+    stage('Blue/Green Production Deployment') {
+      // Logic to identify next deployment colour (blue or green)
+      activeApp = sh(returnStdout: true, script: "oc get service nationalparks -n ${GUID}-parks-prod -o 'jsonpath={ .spec.selector.app }' --ignore-not-found=true").trim()
+      if (activeApp == "nationalparks-blue") {
+        destApp = "nationalparks-green"
+        destColour = "Green"
+      }
+      echo "Active Application:      " + activeApp
+      echo "Destination Application: " + destApp
+
+      // Update the Image on the Production Deployment Config
+      sh "oc set image dc/${destApp} ${destApp}=docker-registry.default.svc:5000/${GUID}-parks-dev/nationalparks:${prodTag} -n ${GUID}-parks-prod"
+
+      // Update the Config Map which contains the deployment colour for the MLBParks application
+      sh "oc delete configmap nationalparks-config -n ${GUID}-parks-prod --ignore-not-found=true"
+      sh "oc create configmap nationalparks-config --from-literal=APPNAME='National Parks (${destColour})' -n ${GUID}-parks-prod"
+
+      // Deploy the inactive application.
+      openshiftDeploy depCfg: destApp, namespace: "${GUID}-parks-prod", verbose: 'false', waitTime: '', waitUnit: 'sec'
+      openshiftVerifyDeployment depCfg: destApp, namespace: "${GUID}-parks-prod", replicaCount: '1', verbose: 'false', verifyReplicaCount: 'true', waitTime: '', waitUnit: 'sec'
+      openshiftVerifyService namespace: "${GUID}-parks-prod", svcName: "${destApp}", verbose: 'false'
+    }
+
+    // Run Integration Tests in the Development Environment.
+    stage('Prod Integration Tests') {
+      echo "Running Integration Tests"
+      // Waiting for Application
+      sleep 35
+      // Curl status of application with /wz/health/ URL
+      sh "curl http://${destApp}.${GUID}-parks-prod.svc.cluster.local:8080/ws/healthz/ | grep -q 'OK'"
+      // Curl endpoint to load data from application into backend database
+      sh "curl http://${destApp}.${GUID}-parks-prod.svc.cluster.local:8080/ws/data/load/ | grep -q 'Items inserted in database: 2740'"
+    }
+
+    stage('Switch over to new Version') {
+      // input "Switch Production?"
+      echo "Switching Production application to ${destApp}."
+      sh "oc delete service nationalparks -n ${GUID}-parks-prod --ignore-not-found=true"
+      sh "oc expose dc ${destApp} --name=nationalparks --port 8080 --labels=type=parksmap-backend,activeApp=${destApp} -n ${GUID}-parks-prod"
+    }
+ 
+  }
+}
+
+// Convenience Functions to read variables from the pom.xml
+// Do not change anything below this line.
+def getVersionFromPom(pom) {
+  def matcher = readFile(pom) =~ '<version>(.+)</version>'
+  matcher ? matcher[0][1] : null
+}
+def getGroupIdFromPom(pom) {
+  def matcher = readFile(pom) =~ '<groupId>(.+)</groupId>'
+  matcher ? matcher[0][1] : null
+}
+def getArtifactIdFromPom(pom) {
+  def matcher = readFile(pom) =~ '<artifactId>(.+)</artifactId>'
+  matcher ? matcher[0][1] : null
+}

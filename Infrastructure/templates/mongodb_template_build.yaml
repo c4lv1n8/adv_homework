@@ -1,0 +1,176 @@
+apiVersion: v1
+kind: Template
+metadata:
+  creationTimestamp: null
+  name: mongodb-build-template
+objects:
+- apiVersion: v1
+  kind: DeploymentConfig
+  metadata:
+    creationTimestamp: null
+    generation: 1
+    name: mongodb
+  spec:
+    replicas: 1
+    selector:
+      name: mongodb
+    strategy:
+      activeDeadlineSeconds: 21600
+      recreateParams:
+        timeoutSeconds: 600
+      resources: {}
+      type: Recreate
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          name: mongodb
+      spec:
+        containers:
+        - env:
+          - name: MONGODB_DATABASE
+            value: "${MONGODB_DATABASE}"
+          - name: MONGODB_USER
+            value: "${MONGODB_USER}"
+          - name: MONGODB_PASSWORD
+            value: "${MONGODB_PASSWORD}"
+          - name: MONGODB_ADMIN_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                key: mongodb-admin-password
+                name: mongodb-secrets
+          - name: MONGODB_SERVICE_NAME
+            value: "${MONGODB_SERVICE}"
+          image: registry.access.redhat.com/rhscl/mongodb-34-rhel7@sha256:27da8fcee8f25ba5cbf57d8cdb4069acd00a80fa7d99cfe2160b8a4088641411
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            failureThreshold: 3
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            successThreshold: 1
+            tcpSocket:
+              port: 27017
+            timeoutSeconds: 1
+          name: mongodb
+          ports:
+          - containerPort: 27017
+            protocol: TCP
+          readinessProbe:
+            exec:
+              command:
+              - /bin/sh
+              - -i
+              - -c
+              - mongo 127.0.0.1:27017/$MONGODB_DATABASE -u $MONGODB_USER -p $MONGODB_PASSWORD
+                --eval="quit()"
+            failureThreshold: 3
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 1
+          resources:
+            limits:
+              cpu: 500m
+              memory: 1536Mi
+            requests:
+              cpu: 50m
+              memory: 256Mi
+          securityContext:
+            capabilities: {}
+            privileged: false
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+          - mountPath: /var/lib/mongodb/data
+            name: mongodb-data
+        dnsPolicy: ClusterFirst
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        terminationGracePeriodSeconds: 30
+        volumes:
+        - name: mongodb-data
+          persistentVolumeClaim:
+            claimName: mongodb-pvc
+    test: false
+    triggers:
+    - imageChangeParams:
+        automatic: true
+        containerNames:
+        - mongodb
+        from:
+          kind: ImageStreamTag
+          name: mongodb:3.4
+          namespace: openshift
+      type: ImageChange
+    - type: ConfigChange
+  status:
+    availableReplicas: 0
+    latestVersion: 0
+    observedGeneration: 0
+    replicas: 0
+    unavailableReplicas: 0
+    updatedReplicas: 0
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    name: mongodb-secrets
+  stringData:
+    mongodb-admin-password: "${MONGODB_ADMIN_PASSWORD}" 
+  type: Opaque
+- apiVersion: v1
+  kind: PersistentVolumeClaim
+  metadata:
+    name: mongodb-pvc
+  spec:
+    accessModes:
+    - ReadWriteOnce
+    resources:
+      requests:
+        storage: 4Gi
+- apiVersion: v1
+  kind: Service
+  metadata:
+    creationTimestamp: null
+    labels:
+      name: mongodb
+    name: "${MONGODB_SERVICE}"
+  spec:
+    ports:
+    - name: "${MONGODB_SERVICE}"
+      port: 27017
+      protocol: TCP
+      targetPort: 27017
+    selector:
+      name: "${MONGODB_SERVICE}"
+    sessionAffinity: None
+    type: ClusterIP
+  status:
+    loadBalancer: {}
+parameters:
+- description: Random MongoDB admin password.
+  displayName: Mongo DB Admin Password
+  name: MONGODB_ADMIN_PASSWORD
+  required: true
+  from: "[a-zA-Z0-9]{16}"
+  generate: expression
+- description: MongoDB Database Name.
+  displayName: MongoDB Database
+  name: MONGODB_DATABASE
+  required: true
+  value: parks
+- description: MongoDB User Name.
+  displayName: MongoDB User
+  name: MONGODB_USER
+  required: true
+  value: mongodb
+- description: MongoDB User Password.
+  displayName: MongoDB Password
+  name: MONGODB_PASSWORD
+  required: true
+  value: mongodb
+- description: MongoDB Service Name.
+  displayName: MongoDB Service
+  name: MONGODB_SERVICE
+  required: true
+  value: mongodb
